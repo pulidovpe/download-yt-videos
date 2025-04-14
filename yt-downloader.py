@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import shutil
+import time
 import json
 import requests
 import os
@@ -24,6 +26,7 @@ class Translator:
     def __init__(self):
         self.session = requests.Session()
         self.base_url = "https://translate.googleapis.com/translate_a/single"
+        self.fallback_url = "https://clients5.google.com/translate_a/t"
         
     def translate(self, text, src='en', dest='es'):
         params = {
@@ -35,14 +38,21 @@ class Translator:
         }
         
         try:
-            response = self.session.get(self.base_url, params=params)
+            # Intentar con el endpoint principal
+            response = self.session.get(self.base_url, params=params, timeout=10)
             if response.status_code == 200:
                 translated = json.loads(response.text)[0][0][0]
-                return type('obj', (object,), {'text': translated})
+                return translated
+                
+            # Fallback a endpoint alternativo
+            response = self.session.get(self.fallback_url, params=params, timeout=10)
+            if response.status_code == 200:
+                return response.json()[0]
+                
         except Exception as e:
             print(Fore.YELLOW + f"Error de traducción: {str(e)}")
         
-        return type('obj', (object,), {'text': text})
+        return text  # Fallback a texto original
 
 class YouTubeDownloader:
     def __init__(self):
@@ -75,132 +85,49 @@ class YouTubeDownloader:
             sys.exit(1)
         return url
 
-    def get_playlist_range(self):
+    def get_playlist_range(self, range_input):
         """
-        Solicita al usuario un rango de videos para descargar de una lista de reproducción.
-        Devuelve el rango como una cadena o None si no se especifica.
+        Procesa el rango de videos ingresado por el usuario.
+
+        :param range_input: Rango especificado (ejemplo: '1-5' o '3')
+        :return: Tupla (start, end) con el rango de videos o (None, None) si no hay rango.
         """
-        print(Fore.YELLOW + "\n🡆 ¿Deseas descargar un rango específico de videos? (ejemplo: 1-5, 3, 7-)")
-        print(Fore.WHITE + "Presiona Enter para descargar toda la lista.")
-        range_input = input(">>> ").strip()
-
-        if range_input:
-            # Validar formato del rango
-            if not re.match(r'^\d+(-\d+)?(-)?$', range_input):
-                print(Fore.RED + "✘ Error: Rango inválido. Usa un formato como 1-5, 3, o 7-.")
-                sys.exit(1)
-            return range_input
-        return None
-
-    def download_content(self, url):
-        # Obtener rango del usuario (si aplica)
-        playlist_range = self.get_playlist_range()
-        
-        cmd = [
-            'yt-dlp',
-            '-f', 'bestvideo+bestaudio',
-            '--merge-output-format', 'mkv',
-            '--convert-subs', 'srt',
-            '--write-subs',
-            '--write-auto-subs',
-            '--sub-langs', 'es',
-            '--embed-subs',
-            '--ignore-errors',
-            '--yes-playlist',
-            '-o', str(TEMP_DIR / '%(playlist_index)s_%(title)s.%(ext)s'),  # Incluye índice único
-            url
-        ]
-
-        # Agregar el rango de la lista si fue proporcionado
-        if playlist_range:
-            cmd.extend(['--playlist-items', playlist_range])
+        if not range_input:
+            return None, None  # Sin rango, descarga todo
 
         try:
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                universal_newlines=True
-            )
-
-            current_pbar = None
-            stdout_lines = []
-            video_count = 0
-
-            while True:
-                line = process.stdout.readline()
-                if not line and process.poll() is not None:
-                    break
-                stdout_lines.append(line.strip())
-
-                # Detectar nuevo video
-                if '[download] Destination:' in line:
-                    filename = line.split('Destination: ')[1].strip()
-                    title = Path(filename).stem[:40]  # Limitar título
-                    video_count += 1
-
-                    # Cerrar barra anterior
-                    if current_pbar:
-                        current_pbar.close()
-
-                    # Crear nueva barra
-                    current_pbar = tqdm(
-                        total=100,
-                        desc=f"{Fore.BLUE}📺 [{video_count}] {title}...",
-                        bar_format="{l_bar}{bar:50}{r_bar}",
-                        leave=False
-                    )
-
-                # Actualizar progreso
-                elif '[download]' in line and '%' in line:
-                    match = re.search(r'(\d+\.?\d*)%', line)
-                    if match and current_pbar:
-                        progress = float(match.group(1))
-                        current_pbar.n = progress
-                        current_pbar.refresh()
-
-            # Cerrar última barra
-            if current_pbar:
-                current_pbar.close()
-
-            # Verificar errores
-            exit_code = process.wait()
-            if exit_code != 0:
-                raise subprocess.CalledProcessError(exit_code, cmd)
-
-        except subprocess.CalledProcessError as e:
-            print(Fore.RED + f"✘ Error en descarga: {str(e)}")
+            if '-' in range_input:
+                start, end = range_input.split('-')
+                return int(start), int(end) if end else None
+            else:
+                start = int(range_input)
+                return start, start  # Un solo video
+        except ValueError:
+            print(Fore.RED + "✘ Formato de rango inválido. Usa un formato como '1-5' o '3'.")
             sys.exit(1)
 
-    def find_files(self):
-        video_files = list(TEMP_DIR.glob('*.mkv'))
-        all_subs = list(TEMP_DIR.glob('*.srt'))
+    def find_files(self, video_path):
+        video_stem = video_path.stem
+        all_subs = list(TEMP_DIR.glob(f'{video_stem}*.srt'))
         
-        if not video_files:
-            print(Fore.RED + "✘ No se encontró el video descargado")
-            sys.exit(1)
-            
-        self.video_path = video_files[0]
+        # Buscar subtítulos en español primero
+        es_subs = list(TEMP_DIR.glob(f'{video_stem}.es.srt')) + \
+                list(TEMP_DIR.glob(f'{video_stem}.es.*.srt'))
         
-        # Clasificar subtítulos
-        subs_priority = [
-            ('es', False),    # ES manual
-            ('en', False),    # EN manual
-            ('es', True),     # ES auto
-            ('en', True)      # EN auto
-        ]
+        if es_subs:
+            sub_path = es_subs[0]
+            print(Fore.CYAN + f"✔ Subtítulos en español encontrados: {sub_path.name}")
+            return sub_path
+
+        # Si no hay en español, buscar en inglés y traducir
+        en_subs = list(TEMP_DIR.glob(f'{video_stem}.en.srt')) + \
+                list(TEMP_DIR.glob(f'{video_stem}.en.*.srt'))
         
-        for lang, auto in subs_priority:
-            pattern = f'*.{"auto" if auto else ""}{lang}*.srt'
-            subs = list(TEMP_DIR.glob(pattern))
-            if subs:
-                self.subs_path = subs[0]
-                print(Fore.CYAN + f"✔ Subtítulos encontrados: {self.subs_path.name}")
-                if auto:
-                    print(Fore.YELLOW + f"⚠ Usando subtítulos autogenerados en {lang.upper()}")
-                return
-        
-        # Si no hay subtítulos, intentar descargar autogenerados
+        if en_subs:
+            print(Fore.YELLOW + "⚠ Subtítulos en español no encontrados, traduciendo desde inglés...")
+            return self.translate_subs(en_subs[0])
+
+        # Si no hay subtítulos, intentar descargar automáticos
         print(Fore.YELLOW + "⚠ No se encontraron subtítulos, intentando descarga alternativa...")
         try:
             subprocess.run([
@@ -208,20 +135,39 @@ class YouTubeDownloader:
                 '--skip-download',
                 '--write-auto-sub',
                 '--sub-langs', 'en',
-                '-o', str(TEMP_DIR / '%(title)s.%(ext)s'),
-                self.url
+                '-o', str(TEMP_DIR / f'{video_stem}.%(ext)s'),
+                '--', video_path.name.split('_', 1)[1]
             ], check=True)
             
-            auto_subs = list(TEMP_DIR.glob('*.en.*.srt'))
-            if auto_subs:
-                self.subs_path = auto_subs[0]
-                return
-        except Exception as e:
+            # Buscar nuevos subtítulos y traducir
+            new_subs = list(TEMP_DIR.glob(f'{video_stem}.en.*.srt'))
+            if new_subs:
+                return self.translate_subs(new_subs[0])
+        
+        except subprocess.CalledProcessError as e:
             print(Fore.RED + f"✘ Error en descarga alternativa: {str(e)}")
         
-        print(Fore.RED + "✘ No se encontraron subtítulos disponibles")
-        sys.exit(1)
+        return None
 
+    def process_videos(self):
+        """Nuevo método para manejar múltiples videos"""
+        video_files = sorted(TEMP_DIR.glob('*.mkv'), key=os.path.getmtime)  # Orden por fecha de descarga
+        
+        for idx, video_path in enumerate(video_files, 1):
+            print(Fore.MAGENTA + f"\nProcesando video {idx}/{len(video_files)}:")
+            print(Fore.WHITE + f"Archivo: {video_path.name}")
+            
+            self.video_path = video_path
+            subs_path = self.find_files(video_path)
+            
+            if subs_path:
+                self.mux_subtitles(video_path, subs_path, idx)
+            else:
+                # Si no hay subtítulos, copiar el video directamente
+                final_path = FINAL_DIR / video_path.name
+                shutil.copy(video_path, final_path)
+                print(Fore.YELLOW + f"⚠ Video copiado sin subtítulos: {final_path.name}")
+    
     def translate_subs(self, sub_path):
         translated_path = TEMP_DIR / "subs_es.srt"
         
@@ -233,7 +179,7 @@ class YouTubeDownloader:
             blocks = content.split('\n\n')
             
             for block in tqdm(blocks, desc=Fore.MAGENTA + "Traduciendo subtítulos",
-                             bar_format="{l_bar}{bar:50}{r_bar}"):
+                             bar_format="{desc}: {percentage:3.0f}% │{bar:50}{r_bar} │ Tiempo: {elapsed}"):
                 if not block.strip():
                     continue
                     
@@ -259,27 +205,34 @@ class YouTubeDownloader:
             print(Fore.RED + f"✘ Error en traducción: {str(e)}")
             return None
 
-    def mux_subtitles(self):
-        if not self.subs_path:
-            print(Fore.YELLOW + "⚠  Sin subtítulos para incluir")
-            return
-            
-        output_path = FINAL_DIR / self.video_path.name
-        cmd = [
-            'mkvmerge',
-            '-o', str(output_path),
-            str(self.video_path),
-            '--track-name', '0:Español',
-            '--language', '0:es',
-            '--default-track', '0:true',
-            str(self.subs_path)
-        ]
-        
+    def mux_subtitles(self, video_path, subs_path, index):
         try:
+            base_name = f"{index:03d}_{video_path.name.split('_', 1)[1]}"
+            output_path = FINAL_DIR / base_name
+            
+            if not subs_path:
+                shutil.copy(video_path, output_path)
+                print(Fore.YELLOW + f"⚠ Copiado sin subtítulos: {base_name}")
+                return
+
+            # Orden CORRECTO de parámetros para mkvmerge
+            cmd = [
+                'mkvmerge',
+                '-o', str(output_path),
+                str(video_path),  # 1. Archivo de video
+                '--language', '0:spa',  # 2. Metadatos PARA EL SIGUIENTE ARCHIVO
+                '--track-name', '0:Español',
+                '--default-track', '0:yes',
+                str(subs_path)  # 3. Archivo de subtítulos (hereda los metadatos anteriores)
+            ]
+            
             subprocess.run(cmd, check=True)
-            print(Fore.GREEN + f"\n✅  Video final creado en: {output_path}")
+            print(Fore.GREEN + f"✅ Video finalizado: {base_name}")
+            
         except subprocess.CalledProcessError as e:
-            print(Fore.RED + f"✘ Error al mezclar subtítulos: {str(e)}")
+            print(Fore.RED + f"✘ Error en mezcla: {str(e)}")
+            shutil.copy(video_path, output_path)
+            print(Fore.YELLOW + f"⚠ Copiado sin subtítulos: {base_name}")
 
     def clean_up(self):
         for f in TEMP_DIR.glob('*'):
@@ -310,14 +263,131 @@ class YouTubeDownloader:
             print("sudo dnf install mkvtoolnix ffmpeg")
             print("pip install yt-dlp googletrans==4.0.0-rc1")
             sys.exit(1)
+        
+        print(Fore.YELLOW + "⚠ Asegúrate de:")
+        print("- Tener Chrome cerrado durante la descarga")
+        print("- Usar un perfil válido en ~/.config/google-chrome")
+
+    def handle_playlist_range(self, range_input):
+        """Procesa el input de rango y devuelve (start, end)"""
+        if not range_input:
+            return None, None
+            
+        try:
+            if '-' in range_input:
+                parts = range_input.split('-')
+                start = int(parts[0]) if parts[0] else 1
+                end = int(parts[1]) if len(parts) > 1 and parts[1] else None
+                return start, end
+            else:
+                return int(range_input), int(range_input)
+        except ValueError:
+            print(Fore.RED + "✘ Formato de rango inválido")
+            sys.exit(1)
+
+    def extract_video_title(self, line):
+        """Extrae el título del video de la línea de log con mejor manejo de errores"""
+        try:
+            # Buscar el título entre comillas después de "Downloading item"
+            match = re.search(r'Downloading item \d+ of playlist "(.+?)"', line)
+            return match.group(1).strip()[:35] + "..." if match else f"Video_{int(time.time())}"
+        except Exception as e:
+            print(Fore.YELLOW + f"⚠ Error extrayendo título: {str(e)}")
+            return "Video_Desconocido"
 
     def run(self):
+        self.setup_dirs()
         self.check_dependencies()
         url = self.get_url()
-        self.download_content(url)
-        self.find_files()
-        self.mux_subtitles()
+
+        # Obtener rango de descarga
+        print(Fore.YELLOW + "\n🡆 ¿Deseas descargar un rango específico de videos? (ejemplo: 1-5, 3, 7-)")
+        print(Fore.YELLOW + "Presiona Enter para descargar toda la lista.")
+        range_input = input(Fore.WHITE + ">>> ").strip()
+        start, end = self.handle_playlist_range(range_input)
+
+        try:
+            # Configurar comando yt-dlp
+            cmd = [
+                'yt-dlp',
+                '--newline',  # Crucial para el procesamiento de líneas
+                '--console-title',  # Mejora la salida de progreso
+                '--cookies-from-browser', 'chrome',
+                '-f', 'bestvideo+bestaudio',
+                '--merge-output-format', 'mkv',
+                '--write-subs',
+                '--write-auto-subs',
+                '--sub-langs', 'en.*,es.*',
+                '--convert-subs', 'srt',
+                '--embed-subs',
+                '--ignore-errors',
+                '--yes-playlist',
+                '-o', str(TEMP_DIR / '%(playlist_index)03d_%(title)s.%(ext)s'),
+                url
+            ]
+
+            # Agregar parámetros de rango
+            if start or end:
+                cmd += ['--playlist-start', str(start), '--playlist-end', str(end) if end else '9999']
+
+            try:
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    bufsize=1,
+                    universal_newlines=True,
+                    text=True  # Asegurar salida como texto
+                )
+                
+                # Captura números decimales o enteros
+                progress_pattern = re.compile(r'\[(?:download)\]\s+(\d{1,3}(?:\.\d+)?)%')  
+                current_pbar = None
+                video_count = 0
+                title = "Inicializando..."
+
+                for line in iter(process.stdout.readline, ''):
+                    line = line.strip()
+                    #print(line)  # Debug: Verifica el contenido de la línea
+                    
+                    # Detectar nuevo video
+                    if '[download]' in line and 'of' in line and 'at' in line:
+                        video_count += 1
+                        current_pbar = tqdm(
+                            total=100,
+                            desc=f"{Fore.BLUE}📥 Video {video_count}: {title[:35]}",
+                            bar_format="{desc}: {percentage:3.0f}% |{bar:50}| {n_fmt}/{total_fmt}",
+                            leave=False
+                        )
+
+                    # Actualizar el progreso
+                    match = progress_pattern.search(line)
+                    if match and current_pbar:
+                        progress = float(match.group(1))
+                        current_pbar.n = progress
+                        current_pbar.refresh()
+
+                        # Si el progreso alcanza el 100%, cierra la barra
+                        if progress >= 100.0:
+                            current_pbar.close()
+                            current_pbar = None
+
+                # Cierra cualquier barra restante al final del proceso
+                if current_pbar:
+                    current_pbar.close()
+
+            except Exception as e:
+                print(Fore.RED + f"Error: {str(e)}")
+
+        except subprocess.CalledProcessError as e:
+            print(Fore.RED + f"\n✘ Error en descarga: {str(e)}")
+            sys.exit(1)
+
+        # Procesar videos descargados
+        print(Fore.GREEN + "\n✅ Descarga completada. Procesando videos...")
+        self.process_videos()
         self.clean_up()
+        print(Fore.CYAN + "\n✨ Proceso finalizado correctamente")
 
 if __name__ == "__main__":
     try:

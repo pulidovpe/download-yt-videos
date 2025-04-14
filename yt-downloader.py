@@ -107,7 +107,7 @@ class YouTubeDownloader:
             '--embed-subs',
             '--ignore-errors',
             '--yes-playlist',
-            '-o', str(TEMP_DIR / '%(title)s.%(ext)s'),
+            '-o', str(TEMP_DIR / '%(playlist_index)s_%(title)s.%(ext)s'),  # Incluye índice único
             url
         ]
 

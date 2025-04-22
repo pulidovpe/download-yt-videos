@@ -10,15 +10,22 @@ import sys
 import tempfile
 import json
 import requests
+import chardet
+from itertools import chain
+from deep_translator import GoogleTranslator
 from pathlib import Path
 from tqdm import tqdm
 from colorama import Fore, Back, Style, init
+from langdetect import detect, DetectorFactory
+from langdetect.lang_detect_exception import LangDetectException
 
 # Inicializar colores
 init(autoreset=True)
 
 # Configuración
-TEMP_DIR = Path(tempfile.gettempdir()) / "yt_downloader"
+#TEMP_DIR = Path(tempfile.gettempdir()) / "yt_downloader"
+TEMP_DIR = Path(os.getcwd()) / "tmp"  # Usar una carpeta "tmp" en el directorio de ejecución
+TEMP_DIR.mkdir(exist_ok=True)  # Crear la carpeta si no existe
 FINAL_DIR = Path.cwd() / "Descargas_YT"
 #FINAL_DIR = Path.home() / "Videos" / "YT_Downloads"
 
@@ -108,26 +115,22 @@ class YouTubeDownloader:
 
     def find_files(self, video_path):
         video_stem = video_path.stem
-        all_subs = list(TEMP_DIR.glob(f'{video_stem}*.srt'))
-        
-        # Buscar subtítulos en español primero
-        es_subs = list(TEMP_DIR.glob(f'{video_stem}.es.srt')) + \
-                list(TEMP_DIR.glob(f'{video_stem}.es.*.srt'))
-        
-        if es_subs:
-            sub_path = es_subs[0]
-            print(Fore.CYAN + f"✔ Subtítulos en español encontrados: {sub_path.name}")
+        print(Fore.CYAN + f"🔍 Procesando subtítulos para: {video_stem}")
+
+        # Buscar subtítulos en español usando el nuevo método
+        sub_path = self.collect_spanish_subs(video_stem)
+        if sub_path:
             return sub_path
 
-        # Si no hay en español, buscar en inglés y traducir
+        # Si no hay subtítulos en español, buscar en inglés y traducir
         en_subs = list(TEMP_DIR.glob(f'{video_stem}.en.srt')) + \
                 list(TEMP_DIR.glob(f'{video_stem}.en.*.srt'))
-        
+
         if en_subs:
             print(Fore.YELLOW + "⚠ Subtítulos en español no encontrados, traduciendo desde inglés...")
-            return self.translate_subs(en_subs[0])
+            return self.translate_subs(en_subs[0], target_language="es")
 
-        # Si no hay subtítulos, intentar descargar automáticos
+        # Intentar descarga alternativa si no hay subtítulos
         print(Fore.YELLOW + "⚠ No se encontraron subtítulos, intentando descarga alternativa...")
         try:
             subprocess.run([
@@ -139,14 +142,12 @@ class YouTubeDownloader:
                 '--', video_path.name.split('_', 1)[1]
             ], check=True)
             
-            # Buscar nuevos subtítulos y traducir
             new_subs = list(TEMP_DIR.glob(f'{video_stem}.en.*.srt'))
             if new_subs:
-                return self.translate_subs(new_subs[0])
-        
+                return self.translate_subs(new_subs[0], target_language="es")
         except subprocess.CalledProcessError as e:
             print(Fore.RED + f"✘ Error en descarga alternativa: {str(e)}")
-        
+
         return None
 
     def process_videos(self):
@@ -161,78 +162,106 @@ class YouTubeDownloader:
             subs_path = self.find_files(video_path)
             
             if subs_path:
-                self.mux_subtitles(video_path, subs_path, idx)
+                # Traducir subtítulos antes de mezclarlos
+                translated_path = self.translate_subs(subs_path, target_language="es")
+                if translated_path:
+                    self.mux_subtitles(video_path, translated_path, idx)
+                else:
+                    print(f"✘ Traducción fallida para subtítulos de {video_path.name}")
             else:
+                print(f"✘ No se encontraron subtítulos para: {video_path.name}")
                 # Si no hay subtítulos, copiar el video directamente
                 final_path = FINAL_DIR / video_path.name
                 shutil.copy(video_path, final_path)
                 print(Fore.YELLOW + f"⚠ Video copiado sin subtítulos: {final_path.name}")
     
-    def translate_subs(self, sub_path):
-        translated_path = TEMP_DIR / "subs_es.srt"
-        
+    def translate_subs(self, sub_path, target_language="es"):
+        """
+        Traduce un archivo de subtítulos a otro idioma utilizando deep-translator.
+
+        :param sub_path: Ruta al archivo de subtítulos.
+        :param target_language: Idioma objetivo para la traducción (por defecto: "es").
+        :return: Ruta del archivo traducido o None si ocurre un error.
+        """
         try:
-            with open(sub_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-                
-            translated = []
-            blocks = content.split('\n\n')
-            
-            for block in tqdm(blocks, desc=Fore.MAGENTA + "Traduciendo subtítulos",
-                             bar_format="{desc}: {percentage:3.0f}% │{bar:50}{r_bar} │ Tiempo: {elapsed}"):
-                if not block.strip():
-                    continue
-                    
-                lines = block.split('\n')
-                if len(lines) >= 3:
-                    text = '\n'.join(lines[2:])
+            # Detectar codificación del archivo
+            with open(sub_path, "rb") as file:
+                raw_data = file.read()
+                detected = chardet.detect(raw_data)
+                encoding = detected["encoding"]
+                print(f"📂 Codificación detectada para {sub_path.name}: {encoding}")
+
+            # Leer subtítulos con la codificación detectada
+            with open(sub_path, "r", encoding=encoding) as file:
+                subtitles = file.readlines()
+
+            # Configurar traductor
+            translator = GoogleTranslator(source="auto", target=target_language)
+
+            # Traducir subtítulos línea por línea
+            translated_subtitles = []
+            total_lines = len(subtitles)
+            for idx, line in enumerate(subtitles, start=1):
+                if line.strip():  # Traducir líneas no vacías
                     try:
-                        translated_text = self.translator.translate(
-                            text, src='en', dest='es'
-                        ).text
-                        translated.append('\n'.join(lines[:2] + [translated_text]))
-                    except:
-                        translated.append(block)
+                        # Mostrar progreso
+                        print(f"Traduciendo línea {idx}/{total_lines}...", end="\r")
+                        translated_line = translator.translate(line.strip())
+                        translated_subtitles.append(translated_line + "\n")
+                    except Exception as e:
+                        print(f"\n⚠ Error al traducir línea {idx}: {line.strip()[:50]}... | {e}")
+                        translated_subtitles.append(line)  # Mantener línea original en caso de error
                 else:
-                    translated.append(block)
-                    
-            with open(translated_path, 'w', encoding='utf-8') as f:
-                f.write('\n\n'.join(translated))
-                
+                    translated_subtitles.append(line)
+
+            print("\n✔ Traducción completa.")
+
+            # Guardar subtítulos traducidos
+            translated_path = sub_path.with_suffix(f".{target_language}.srt")
+            with open(translated_path, "w", encoding="utf-8") as file:
+                file.writelines(translated_subtitles)
+
+            print(f"✔ Subtítulos traducidos guardados en: {translated_path}")
             return translated_path
-            
+
+        except UnicodeDecodeError as e:
+            print(f"✘ Error de codificación en {sub_path.name}: {e}")
+            return None
         except Exception as e:
-            print(Fore.RED + f"✘ Error en traducción: {str(e)}")
+            print(f"✘ Error inesperado al traducir subtítulos {sub_path.name}: {e}")
             return None
 
-    def mux_subtitles(self, video_path, subs_path, index):
-        try:
-            base_name = f"{index:03d}_{video_path.name.split('_', 1)[1]}"
-            output_path = FINAL_DIR / base_name
-            
-            if not subs_path:
-                shutil.copy(video_path, output_path)
-                print(Fore.YELLOW + f"⚠ Copiado sin subtítulos: {base_name}")
-                return
+    def mux_subtitles(self, video_path, subs_path, idx):
+        """
+        Combina el video con los subtítulos en un nuevo archivo.
+        """
+        import subprocess
 
-            # Orden CORRECTO de parámetros para mkvmerge
-            cmd = [
-                'mkvmerge',
-                '-o', str(output_path),
-                str(video_path),  # 1. Archivo de video
-                '--language', '0:spa',  # 2. Metadatos PARA EL SIGUIENTE ARCHIVO
-                '--track-name', '0:Español',
-                '--default-track', '0:yes',
-                str(subs_path)  # 3. Archivo de subtítulos (hereda los metadatos anteriores)
-            ]
-            
+        print(f"🎞 Procesando archivo de video: {video_path.name}")
+        output_path = video_path.parent / f"{video_path.stem}_muxed{video_path.suffix}"
+
+        # Asegurarnos de que subs_list sea una lista de tuplas
+        if isinstance(subs_path, PosixPath):
+            # Convertir un único subtítulo en una lista de tuplas
+            subs_list = [(subs_path, "español")]
+        elif isinstance(subs_path, list):
+            # Validar que la lista esté en el formato correcto
+            subs_list = [(path, "español") for path in subs_path]
+        else:
+            raise ValueError(f"Formato de subs_path no reconocido: {subs_path}")
+
+        # Construcción del comando ffmpeg
+        cmd = ["ffmpeg", "-i", str(video_path)]
+        for i, (sub_path, label) in enumerate(subs_list):
+            cmd.extend(["-sub_charenc", "UTF-8", "-i", str(sub_path)])
+        cmd.extend(["-map", "0:v", "-map", "0:a", "-map", f"{i + 1}:s", "-c", "copy", str(output_path)])
+
+        try:
+            print(f"▶ Ejecutando ffmpeg: {' '.join(cmd)}")
             subprocess.run(cmd, check=True)
-            print(Fore.GREEN + f"✅ Video finalizado: {base_name}")
-            
+            print(f"✔ Archivo combinado creado: {output_path}")
         except subprocess.CalledProcessError as e:
-            print(Fore.RED + f"✘ Error en mezcla: {str(e)}")
-            shutil.copy(video_path, output_path)
-            print(Fore.YELLOW + f"⚠ Copiado sin subtítulos: {base_name}")
+            print(f"❌ Error al combinar el video con subtítulos: {e}")
 
     def clean_up(self):
         for f in TEMP_DIR.glob('*'):
@@ -389,10 +418,188 @@ class YouTubeDownloader:
         self.clean_up()
         print(Fore.CYAN + "\n✨ Proceso finalizado correctamente")
 
+    def detect_language(self, sub_path):
+        """
+        Detecta el idioma de un archivo de subtítulos.
+        :param sub_path: Ruta del archivo de subtítulos.
+        :return: Código del idioma detectado (ejemplo: 'es', 'en') o None si ocurre un error.
+        """
+        try:
+            with open(sub_path, "r", encoding="utf-8") as file:
+                content = file.read()
+
+            # Usa deep-translator para detectar el idioma (basado en el contenido)
+            translator = GoogleTranslator(source='auto', target='es')
+            detected_lang = translator.detect(content)
+            print(f"🔍 Idioma detectado para {sub_path.name}: {detected_lang}")
+            return detected_lang
+
+        except Exception as e:
+            print(f"✘ Error al detectar idioma en {sub_path.name}: {e}")
+            return None
+    
+    def process_existing_videos(self, folder_path):
+        """
+        Procesa videos y subtítulos existentes en una carpeta:
+        1. Detecta si los subtítulos están en español.
+        2. Traduce subtítulos al español si no lo están.
+        3. Inserta los subtítulos como predeterminados en los videos.
+
+        :param folder_path: Ruta de la carpeta con los videos y subtítulos.
+        """
+        folder = Path(folder_path)
+        if not folder.is_dir():
+            print(Fore.RED + "✘ La ruta proporcionada no es una carpeta válida.")
+            return
+
+        # Buscar archivos de video y subtítulos
+        video_files = sorted(chain(
+            folder.glob('*.mkv'),
+            folder.glob('*.mp4'),
+            folder.glob('*.avi'),
+            folder.glob('*.mov'),
+        ))
+        subtitle_files = sorted(folder.glob('*.srt'))
+
+        if not video_files or not subtitle_files:
+            print(Fore.RED + "✘ No se encontraron videos o subtítulos en la carpeta.")
+            return
+
+        print(Fore.CYAN + f"📁 Procesando carpeta: {folder.resolve()}")
+        for video_file in video_files:
+            # Encontrar subtítulo correspondiente (mismo nombre base)
+            base_name = video_file.stem
+            subtitle_file = next((s for s in subtitle_files if s.stem.startswith(base_name)), None)
+
+            if not subtitle_file:
+                print(Fore.YELLOW + f"⚠ No se encontró subtítulo para: {video_file.name}")
+                continue
+
+            print(Fore.CYAN + f"✔ Procesando: {video_file.name} con {subtitle_file.name}")
+
+            # Detectar idioma del subtítulo
+            try:
+                print(f"🔍 Detectando idioma para {subtitle_file.name}...")
+                with open(subtitle_file, "r", encoding="utf-8") as file:
+                    sample_text = ''.join(file.readlines()[:10])  # Usar las primeras 10 líneas como muestra
+                detected_language = detect(sample_text)
+                print(f"🗣 Idioma detectado: {detected_language}")
+
+                if detected_language == "es":
+                    print(f"✔ {subtitle_file.name} ya está en español. Usando directamente.")
+                    translated_path = subtitle_file  # Usar el subtítulo existente
+                else:
+                    response = input(Fore.CYAN + "\n¿Deseas traducir el subtitulo? (s/n): ").strip().lower()
+                    if response in ('s', 'si', 'sí'):
+                        # Traducir subtítulos
+                        translated_path = self.translate_subs(subtitle_file, target_language="es")
+                        if not translated_path:
+                            print(Fore.RED + f"✘ Error al traducir subtítulos para: {video_file.name}")
+                            continue
+                    else:
+                        translated_path = subtitle_file  # Usar el subtítulo existente
+    
+            except LangDetectException as e:
+                print(Fore.RED + f"✘ Error al detectar idioma de {subtitle_file.name}: {e}")
+                continue
+            except Exception as e:
+                print(Fore.RED + f"✘ Error inesperado: {e}")
+                continue
+
+            # Insertar subtítulos en el video
+            output_path = folder / f"translated_{video_file.name}"
+            cmd = [
+                'mkvmerge',
+                '-o', str(output_path.resolve()),
+                str(video_file.resolve()),
+                '--track-name', '0:Español',
+                '--language', '0:es',
+                '--default-track', '0:true',
+                str(translated_path.resolve())
+            ]
+
+            try:
+                subprocess.run(cmd, check=True)
+                print(Fore.GREEN + f"✅ Subtítulo insertado en: {output_path.name}")
+            except subprocess.CalledProcessError as e:
+                print(Fore.RED + f"✘ Error al insertar subtítulos en: {video_file.name}")
+                print(Fore.RED + str(e))
+                continue
+
+        print(Fore.GREEN + "\n✔ Todos los videos procesados.")
+
+
+    def collect_spanish_subs(self, video_path):
+        """
+        Busca y devuelve la ruta del archivo de subtítulos en español correspondiente al video.
+        """
+        from pathlib import Path
+
+        # Asegurarse de que video_path sea un objeto Path
+        video_path = Path(video_path) if isinstance(video_path, str) else video_path
+
+        # Construir la ruta esperada para los subtítulos
+        stem = video_path.stem  # Esto ahora funciona porque video_path es un Path
+        subs_file = TEMP_DIR / f"{stem}.es.srt"
+
+        if subs_file.exists():
+            print(f"✔ Subtítulos encontrados: {subs_file}")
+            return subs_file
+        else:
+            print(f"⚠ No se encontraron subtítulos para: {video_path.name}")
+            return None
+
+    def cleanup_temp_files(self):
+        """Elimina los archivos en la carpeta temporal si el usuario lo confirma."""
+        response = input(Fore.CYAN + "\n¿Deseas eliminar los archivos temporales? (s/n): ").strip().lower()
+        if response in ('s', 'si', 'sí'):
+            if TEMP_DIR.exists():
+                print("🧹 Limpiando archivos temporales...")
+                shutil.rmtree(TEMP_DIR)
+                print("✔ Archivos temporales eliminados.")
+            else:
+                print("No hay archivos temporales para limpiar.")
+        else:
+            print(Fore.YELLOW + "⚠ Los archivos temporales no fueron eliminados.")
+
 if __name__ == "__main__":
     try:
         downloader = YouTubeDownloader()
-        downloader.run()
+        while True:
+            # Menú interactivo
+            print(Fore.CYAN + "\n🡆 Selecciona una opción:")
+            print(Fore.YELLOW + "1. Descargar videos y subtítulos desde YouTube.")
+            print(Fore.YELLOW + "2. Procesar videos y subtítulos existentes en una carpeta.")
+            print(Fore.YELLOW + "3. Traducir subtítulos existentes en una carpeta.")
+            print(Fore.YELLOW + "4. Salir.")
+
+            choice = input(Fore.WHITE + ">>> ").strip()
+
+            if choice == "1":
+                print(Fore.CYAN + "\n🡆 Iniciando descarga de videos...")
+                downloader.run()
+            elif choice == "2":
+                print(Fore.CYAN + "\n🡆 Proporciona la carpeta con videos y subtítulos:")
+                folder_path = input(Fore.WHITE + ">>> ").strip()
+                downloader.process_existing_videos(folder_path)
+            elif choice == "3":
+                subs_folder = Path(input("📂 Ingresa la ruta de la carpeta con subtítulos: "))
+                for sub_file in subs_folder.glob("*.srt"):
+                    translated_path = downloader.translate_subs(sub_file)
+                    if translated_path:
+                        print(f"✔ Subtítulos traducidos: {translated_path}")
+                    else:
+                        print(f"✘ No se pudo traducir subtítulos: {sub_file.name}")
+                break
+            elif choice == "4":
+                print(Fore.GREEN + "\n✔ Gracias por usar el programa. ¡Hasta pronto!")
+                break
+            else:
+                print(Fore.RED + "✘ Opción inválida. Por favor selecciona 1, 2, 3 o 4.")
+        
+        # Preguntar si eliminar archivos temporales
+        downloader.cleanup_temp_files()
+
     except KeyboardInterrupt:
         print(Fore.RED + "\n✘ Operación cancelada por el usuario")
         sys.exit(130)

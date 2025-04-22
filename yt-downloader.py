@@ -23,11 +23,9 @@ from langdetect.lang_detect_exception import LangDetectException
 init(autoreset=True)
 
 # Configuración
-#TEMP_DIR = Path(tempfile.gettempdir()) / "yt_downloader"
 TEMP_DIR = Path(os.getcwd()) / "tmp"  # Usar una carpeta "tmp" en el directorio de ejecución
 TEMP_DIR.mkdir(exist_ok=True)  # Crear la carpeta si no existe
 FINAL_DIR = Path.cwd() / "Descargas_YT"
-#FINAL_DIR = Path.home() / "Videos" / "YT_Downloads"
 
 class Translator:
     def __init__(self):
@@ -466,13 +464,29 @@ class YouTubeDownloader:
             return
 
         print(Fore.CYAN + f"📁 Procesando carpeta: {folder.resolve()}")
+
+        # Convertir subtítulos a UTF-8 o validar si ya están en UTF-8
+        utf8_subtitles = []
+        for subtitle_file in subtitle_files:
+            if self.is_utf8(subtitle_file):
+                # Si ya está en UTF-8, agregarlo directamente
+                print(Fore.GREEN + f"✔ {subtitle_file.name} ya está en UTF-8.")
+                utf8_subtitles.append(subtitle_file)
+            else:
+                # Intentar convertirlo a UTF-8
+                utf8_sub_path = self.convert_srt_to_utf8(subtitle_file)
+                if utf8_sub_path:
+                    utf8_subtitles.append(utf8_sub_path)
+                else:
+                    print(Fore.RED + f"✘ No se pudo convertir {subtitle_file.name} a UTF-8. Omitiendo.")
+
         for video_file in video_files:
-            # Encontrar subtítulo correspondiente (mismo nombre base)
+            # Encontrar subtítulo correspondiente (mismo nombre base) en la lista de UTF-8
             base_name = video_file.stem
-            subtitle_file = next((s for s in subtitle_files if s.stem.startswith(base_name)), None)
+            subtitle_file = next((s for s in utf8_subtitles if s.stem.startswith(base_name)), None)
 
             if not subtitle_file:
-                print(Fore.YELLOW + f"⚠ No se encontró subtítulo para: {video_file.name}")
+                print(Fore.YELLOW + f"⚠ No se encontró subtítulo UTF-8 para: {video_file.name}")
                 continue
 
             print(Fore.CYAN + f"✔ Procesando: {video_file.name} con {subtitle_file.name}")
@@ -498,7 +512,7 @@ class YouTubeDownloader:
                             continue
                     else:
                         translated_path = subtitle_file  # Usar el subtítulo existente
-    
+
             except LangDetectException as e:
                 print(Fore.RED + f"✘ Error al detectar idioma de {subtitle_file.name}: {e}")
                 continue
@@ -527,7 +541,6 @@ class YouTubeDownloader:
                 continue
 
         print(Fore.GREEN + "\n✔ Todos los videos procesados.")
-
 
     def collect_spanish_subs(self, video_path):
         """
@@ -562,6 +575,56 @@ class YouTubeDownloader:
         else:
             print(Fore.YELLOW + "⚠ Los archivos temporales no fueron eliminados.")
 
+    def is_utf8(self, file_path):
+        """
+        Verifica si un archivo está codificado en UTF-8.
+
+        :param file_path: Ruta del archivo.
+        :return: True si está en UTF-8, False en caso contrario.
+        """
+        try:
+            with open(file_path, 'r', encoding='utf-8') as file:
+                file.read()  # Intentar leer el archivo completo
+            return True
+        except UnicodeDecodeError:
+            return False
+
+    def convert_srt_to_utf8(self, srt_path):
+        """
+        Convierte un archivo .srt a UTF-8 si no está ya en esta codificación.
+
+        :param srt_path: Ruta al archivo .srt.
+        :return: Ruta al archivo convertido o None si ocurre un error.
+        """
+        try:
+            # Detectar la codificación del archivo
+            with open(srt_path, "rb") as file:
+                raw_data = file.read()
+                detected = chardet.detect(raw_data)
+                encoding = detected["encoding"]
+                print(f"📂 Codificación detectada para {srt_path.name}: {encoding}")
+
+            # Si ya está en UTF-8, no es necesario convertir
+            if encoding.lower() == "utf-8":
+                print(f"✔ {srt_path.name} ya está en UTF-8. No se necesita conversión.")
+                return srt_path
+
+            # Leer el archivo con la codificación detectada
+            with open(srt_path, "r", encoding=encoding) as file:
+                content = file.read()
+
+            # Guardar el archivo en UTF-8
+            utf8_path = srt_path.with_suffix(".utf8.srt")
+            with open(utf8_path, "w", encoding="utf-8") as file:
+                file.write(content)
+
+            print(f"✔ Archivo convertido a UTF-8: {utf8_path.name}")
+            return utf8_path
+
+        except Exception as e:
+            print(f"✘ Error al convertir {srt_path.name} a UTF-8: {e}")
+            return None
+
 if __name__ == "__main__":
     try:
         downloader = YouTubeDownloader()
@@ -571,7 +634,8 @@ if __name__ == "__main__":
             print(Fore.YELLOW + "1. Descargar videos y subtítulos desde YouTube.")
             print(Fore.YELLOW + "2. Procesar videos y subtítulos existentes en una carpeta.")
             print(Fore.YELLOW + "3. Traducir subtítulos existentes en una carpeta.")
-            print(Fore.YELLOW + "4. Salir.")
+            print(Fore.YELLOW + "4. Recodificar subtítulos existentes en una carpeta a UTF-8.")
+            print(Fore.YELLOW + "5. Salir.")
 
             choice = input(Fore.WHITE + ">>> ").strip()
 
@@ -592,6 +656,19 @@ if __name__ == "__main__":
                         print(f"✘ No se pudo traducir subtítulos: {sub_file.name}")
                 break
             elif choice == "4":
+                folder_path = input("📂 Ingresa la ruta de la carpeta con subtítulos: ")
+                folder = Path(folder_path)
+                if not folder.is_dir():
+                    print(Fore.RED + "✘ La ruta proporcionada no es una carpeta válida.")
+                else:
+                    print(Fore.CYAN + f"📁 Procesando carpeta: {folder.resolve()}")
+                    srt_files = list(folder.glob("*.srt"))
+                    if not srt_files:
+                        print(Fore.RED + "✘ No se encontraron archivos .srt en la carpeta.")
+                    else:
+                        for srt_file in srt_files:
+                            downloader.convert_srt_to_utf8(srt_file)
+            elif choice == "5":
                 print(Fore.GREEN + "\n✔ Gracias por usar el programa. ¡Hasta pronto!")
                 break
             else:
